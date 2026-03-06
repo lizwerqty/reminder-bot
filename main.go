@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
@@ -33,6 +34,51 @@ type ReminderStore struct {
 	items     []Reminder
 	nextID    int64
 	lastDirty bool
+}
+
+type UserStep string
+
+const (
+	stepNone          UserStep = ""
+	stepAwaitDuration UserStep = "await_duration"
+	stepAwaitText     UserStep = "await_text"
+)
+
+type UserState struct {
+	Step     UserStep
+	Duration time.Duration
+}
+
+type StateStore struct {
+	mu    sync.Mutex
+	items map[int64]UserState
+}
+
+func NewStateStore() *StateStore {
+	return &StateStore{items: make(map[int64]UserState)}
+}
+
+func (s *StateStore) Set(chatID int64, state UserState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.items[chatID] = state
+}
+
+func (s *StateStore) Get(chatID int64) UserState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.items[chatID]
+}
+
+func (s *StateStore) Clear(chatID int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.items, chatID)
+}
+
+type BotReply struct {
+	Text        string
+	ReplyMarkup interface{}
 }
 
 func NewReminderStore(filePath string) (*ReminderStore, error) {
@@ -167,6 +213,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("init storage: %v", err)
 	}
+	stateStore := NewStateStore()
 
 	bot, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
@@ -176,6 +223,7 @@ func main() {
 	bot.Debug = false
 	log.Printf("authorized as @%s", bot.Self.UserName)
 
+	go runHealthServer()
 	go runScheduler(bot, store)
 
 	u := tgbotapi.NewUpdate(0)
@@ -186,21 +234,52 @@ func main() {
 		if update.Message == nil {
 			continue
 		}
-		if !update.Message.IsCommand() {
-			continue
-		}
-
 		chatID := update.Message.Chat.ID
 		userID := int64(0)
 		if update.Message.From != nil {
 			userID = int64(update.Message.From.ID)
 		}
 
-		resp := handleCommand(store, update.Message.Command(), update.Message.CommandArguments(), chatID, userID)
-		msg := tgbotapi.NewMessage(chatID, resp)
+		var resp BotReply
+		if update.Message.IsCommand() {
+			resp = handleCommand(store, stateStore, update.Message.Command(), update.Message.CommandArguments(), chatID, userID)
+		} else {
+			resp = handleTextMessage(store, stateStore, chatID, userID, update.Message.Text)
+		}
+		if resp.Text == "" {
+			continue
+		}
+
+		msg := tgbotapi.NewMessage(chatID, resp.Text)
+		if resp.ReplyMarkup != nil {
+			msg.ReplyMarkup = resp.ReplyMarkup
+		}
 		if _, err := bot.Send(msg); err != nil {
 			log.Printf("send message: %v", err)
 		}
+	}
+}
+
+func runHealthServer() {
+	port := strings.TrimSpace(os.Getenv("PORT"))
+	if port == "" {
+		return
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	addr := ":" + port
+	log.Printf("health server listening on %s", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Printf("health server stopped: %v", err)
 	}
 }
 
@@ -225,20 +304,27 @@ func runScheduler(bot *tgbotapi.BotAPI, store *ReminderStore) {
 	}
 }
 
-func handleCommand(store *ReminderStore, command, args string, chatID, userID int64) string {
+func handleCommand(store *ReminderStore, stateStore *StateStore, command, args string, chatID, userID int64) BotReply {
+	if command != "cancel" {
+		stateStore.Clear(chatID)
+	}
+
 	switch command {
 	case "start", "help":
-		return helpText()
+		return BotReply{Text: helpText(), ReplyMarkup: mainKeyboard()}
 	case "in":
-		return createInReminder(store, chatID, userID, args)
+		return BotReply{Text: createInReminder(store, chatID, userID, args), ReplyMarkup: mainKeyboard()}
 	case "at":
-		return createAtReminder(store, chatID, userID, args)
+		return BotReply{Text: createAtReminder(store, chatID, userID, args), ReplyMarkup: mainKeyboard()}
 	case "list":
-		return listReminders(store, chatID)
+		return BotReply{Text: listReminders(store, chatID), ReplyMarkup: mainKeyboard()}
 	case "delete":
-		return deleteReminder(store, chatID, args)
+		return BotReply{Text: deleteReminder(store, chatID, args), ReplyMarkup: mainKeyboard()}
+	case "cancel":
+		stateStore.Clear(chatID)
+		return BotReply{Text: "Ок, отменил текущий шаг", ReplyMarkup: mainKeyboard()}
 	default:
-		return "Неизвестная команда. Нажми /help"
+		return BotReply{Text: "Неизвестная команда. Нажми /help", ReplyMarkup: mainKeyboard()}
 	}
 }
 
@@ -246,12 +332,106 @@ func helpText() string {
 	return strings.Join([]string{
 		"Я бот-напоминалка.",
 		"",
+		"Можно пользоваться кнопками или командами.",
+		"",
 		"Команды:",
 		"/in <длительность> <текст> - напомнить через время. Пример: /in 10m Позвонить маме",
 		"/at <YYYY-MM-DD HH:MM> <текст> - напомнить в конкретное время. Пример: /at 2026-03-06 21:30 Выпить воду",
 		"/list - показать активные напоминания",
 		"/delete <id> - удалить напоминание",
+		"/cancel - отменить текущий шаг",
 	}, "\n")
+}
+
+func handleTextMessage(store *ReminderStore, stateStore *StateStore, chatID, userID int64, text string) BotReply {
+	trimmed := strings.TrimSpace(text)
+	switch trimmed {
+	case "❓ Помощь":
+		stateStore.Clear(chatID)
+		return BotReply{Text: helpText(), ReplyMarkup: mainKeyboard()}
+	case "📋 Мои напоминания":
+		stateStore.Clear(chatID)
+		return BotReply{Text: listReminders(store, chatID), ReplyMarkup: mainKeyboard()}
+	case "➕ Добавить":
+		stateStore.Set(chatID, UserState{Step: stepAwaitDuration})
+		return BotReply{
+			Text:        "Выбери через сколько напомнить:",
+			ReplyMarkup: durationKeyboard(),
+		}
+	case "Отмена":
+		stateStore.Clear(chatID)
+		return BotReply{Text: "Ок, отменил", ReplyMarkup: mainKeyboard()}
+	}
+
+	state := stateStore.Get(chatID)
+	switch state.Step {
+	case stepAwaitDuration:
+		d, err := time.ParseDuration(trimmed)
+		if err != nil || d <= 0 {
+			return BotReply{
+				Text:        "Не понял длительность. Выбери кнопку или введи формат типа 10m, 1h, 24h.",
+				ReplyMarkup: durationKeyboard(),
+			}
+		}
+		stateStore.Set(chatID, UserState{Step: stepAwaitText, Duration: d})
+		return BotReply{
+			Text:        fmt.Sprintf("Отлично. Теперь отправь текст напоминания (через %s).", d),
+			ReplyMarkup: cancelKeyboard(),
+		}
+	case stepAwaitText:
+		if trimmed == "" {
+			return BotReply{Text: "Текст не должен быть пустым. Напиши, о чем напомнить.", ReplyMarkup: cancelKeyboard()}
+		}
+		remindAt := time.Now().Add(state.Duration)
+		r, err := store.Add(chatID, userID, trimmed, remindAt)
+		if err != nil {
+			log.Printf("add reminder by buttons: %v", err)
+			return BotReply{Text: "Не получилось сохранить напоминание", ReplyMarkup: mainKeyboard()}
+		}
+		stateStore.Clear(chatID)
+		return BotReply{
+			Text:        fmt.Sprintf("Готово. Напомню в %s (id: %d)", remindAt.Format("2006-01-02 15:04"), r.ID),
+			ReplyMarkup: mainKeyboard(),
+		}
+	default:
+		return BotReply{
+			Text:        "Используй кнопки ниже или введи /help",
+			ReplyMarkup: mainKeyboard(),
+		}
+	}
+}
+
+func mainKeyboard() tgbotapi.ReplyKeyboardMarkup {
+	return tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("➕ Добавить"),
+			tgbotapi.NewKeyboardButton("📋 Мои напоминания"),
+		),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("❓ Помощь"),
+		),
+	)
+}
+
+func durationKeyboard() tgbotapi.ReplyKeyboardMarkup {
+	return tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("10m"),
+			tgbotapi.NewKeyboardButton("1h"),
+			tgbotapi.NewKeyboardButton("24h"),
+		),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("Отмена"),
+		),
+	)
+}
+
+func cancelKeyboard() tgbotapi.ReplyKeyboardMarkup {
+	return tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("Отмена"),
+		),
+	)
 }
 
 func createInReminder(store *ReminderStore, chatID, userID int64, args string) string {
